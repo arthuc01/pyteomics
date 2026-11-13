@@ -5151,3 +5151,107 @@ class ProteoformCombinator:
                 if labile_remaining:
                     template.labile_modifications = labile_remaining
                 yield template
+
+
+def validate(sequence: str, *, resolve: bool = False) -> 'ValidationReport':
+    """Validate a ProForma string and return structured diagnostics.
+
+    Parsing is always local. Set ``resolve=True`` to additionally resolve
+    modification masses, which may require optional controlled-vocabulary
+    dependencies.
+    """
+    from .validation import Severity, ValidationReport
+
+    report = ValidationReport()
+    try:
+        parsed = ProForma.parse(sequence)
+    except ProFormaError as error:
+        index = getattr(error, 'index', None)
+        report.add(
+            'proforma.syntax',
+            getattr(error, 'message', str(error)),
+            Severity.ERROR,
+            location='character {}'.format(index) if index is not None else None,
+            suggestion='Check delimiters and the ordering of ProForma sections.',
+        )
+        return report
+
+    if parsed.charge_state is not None and parsed.charge_state.charge == 0:
+        report.add(
+            'proforma.charge.zero',
+            'A ProForma charge state cannot be zero.',
+            Severity.ERROR,
+            location='charge state',
+            suggestion='Remove the charge suffix or use a non-zero charge.',
+        )
+
+    if resolve:
+        try:
+            parsed.mass
+        except Exception as error:
+            report.add(
+                'proforma.modification.unresolved',
+                'One or more modification masses could not be resolved: {}'.format(error),
+                Severity.ERROR,
+                suggestion='Use a mass delta or install the optional ProForma dependencies.',
+            )
+    return report
+
+
+def _describe_modification(tag, *, category, position=None, residue=None):
+    try:
+        mass = tag.mass
+    except Exception:
+        mass = None
+    return {
+        'category': category,
+        'position': position,
+        'residue': residue,
+        'label': str(tag),
+        'mass': mass,
+    }
+
+
+def explain(sequence: str) -> dict:
+    """Return a structured, human-readable description of a ProForma string."""
+    parsed = ProForma.parse(sequence)
+    modifications = []
+
+    for index, (residue, tags) in enumerate(parsed.sequence, 1):
+        for tag in tags or ():
+            if tag.is_modification():
+                modifications.append(_describe_modification(
+                    tag, category='localized', position=index, residue=residue))
+
+    for tag in parsed.n_term or ():
+        modifications.append(_describe_modification(tag, category='n_term'))
+    for tag in parsed.c_term or ():
+        modifications.append(_describe_modification(tag, category='c_term'))
+    for tag in parsed.labile_modifications or ():
+        modifications.append(_describe_modification(tag, category='labile'))
+    for tag in parsed.unlocalized_modifications or ():
+        modifications.append(_describe_modification(tag, category='unlocalized'))
+    for rule in parsed.fixed_modifications or ():
+        entry = _describe_modification(rule.modification_tag, category='fixed')
+        entry['targets'] = [str(target) for target in rule.targets]
+        modifications.append(entry)
+    for interval in parsed.intervals or ():
+        for tag in interval.tags or ():
+            if tag.is_modification():
+                entry = _describe_modification(tag, category='interval')
+                entry['start'] = interval.start + 1
+                entry['end'] = interval.end
+                modifications.append(entry)
+
+    charge = parsed.charge_state.charge if parsed.charge_state is not None else None
+    return {
+        'input': sequence,
+        'canonical': str(parsed),
+        'sequence': ''.join(residue for residue, _ in parsed.sequence),
+        'length': len(parsed),
+        'charge': charge,
+        # The surrounding ``<...>`` belongs to ProForma syntax, not the
+        # isotope name a person generally wants to display.
+        'isotopes': [isotope.isotope for isotope in parsed.isotopes or ()],
+        'modifications': modifications,
+    }
